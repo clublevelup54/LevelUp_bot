@@ -362,10 +362,13 @@ def handle_update(update):
             if e: send_message(ADMIN_CHAT_ID, f"❌ <b>{fn} {ln}</b> (@{un}) не сможет — «{e['name']}»")
         elif data.startswith("info_"):
             eid = int(data[5:]); e = get_event(eid)
+            rsvp_kb = {"inline_keyboard":[[
+                {"text":"✅ ИДУ НА ВСТРЕЧУ","callback_data":f"go_{eid}"},
+                {"text":"❌ НЕ СМОГУ","callback_data":f"no_{eid}"}]]}
             if e and e.get("description"):
-                send_message(cid, f"📋 <b>{e['name']}</b>\n\n{e['description']}\n\n📅 {e['date']} в {e['time']}\n📍 {e['place']}")
+                send_message(cid, f"📋 <b>{e['name']}</b>\n\n{e['description']}\n\n📅 {e['date']} в {e['time']}\n📍 {e['place']}", rsvp_kb)
             elif e:
-                send_message(cid, f"📋 <b>{e['name']}</b>\n\n📅 {e['date']} в {e['time']}\n📍 {e['place']}\n\nОписание пока не добавлено.")
+                send_message(cid, f"📋 <b>{e['name']}</b>\n\n📅 {e['date']} в {e['time']}\n📍 {e['place']}\n\nОписание пока не добавлено.", rsvp_kb)
             answer_callback(cb["id"],"")
         return
 
@@ -497,6 +500,27 @@ def handle_update(update):
         ok = send_event_to_user(e["id"], user)
         send_message(cid, f"✅ Отправлено @{uname}!" if ok else f"❌ Ошибка")
 
+    elif text.startswith("/remindall") and cid == ADMIN_CHAT_ID:
+        parts = text.split(); eid = resolve_event_num(parts)
+        if not eid: send_message(cid,"❌ Не найдено. /events"); return
+        e = get_event(eid)
+        # Все резиденты минус те, кто ответил «не смогу»
+        conn = get_db(); c = conn.cursor()
+        c.execute("""SELECT u.chat_id, u.first_name, u.last_name, u.username FROM users u
+                     INNER JOIN contacts ct ON LOWER(u.username)=LOWER(ct.username)
+                     LEFT JOIN rsvp r ON u.chat_id=r.chat_id AND r.event_id=?
+                     WHERE r.status IS NULL OR r.status='going'""", (eid,))
+        users = [dict(r) for r in c.fetchall()]; conn.close()
+        if not users: send_message(cid,"Все отказались — некому отправлять."); return
+        send_message(cid, f"⏰ Напоминание ({len(users)} чел.) по «{e['name']}»...\nПропускаем тех, кто ответил «не смогу».")
+        sent=errors=0
+        for u in users:
+            result = send_message(u["chat_id"], f"⏰ <b>Напоминание!</b>\n\n{etxt(e)}\n\nТы придёшь?", make_kb(eid))
+            if result.get("ok"): sent+=1
+            else: errors+=1
+            time.sleep(0.05)
+        send_message(cid, f"✅ Готово! Отправлено: {sent}, ошибок: {errors}")
+
     elif text.startswith("/remind") and cid == ADMIN_CHAT_ID:
         parts = text.split(); eid = resolve_event_num(parts)
         if not eid: send_message(cid,"❌ Не найдено."); return
@@ -546,7 +570,7 @@ def handle_update(update):
         h = "📋 <b>Команды:</b>\n\n/start — О ближайшей встрече\n"
         if cid == ADMIN_CHAT_ID:
             h += ("\n<b>Мероприятия:</b>\n/newevent — создать\n/events — активные\n/archive — прошедшие\n/edit N — редактировать\n/cleanup — архивировать прошедшие\n\n"
-                  "<b>Рассылки:</b>\n/broadcast N — всем\n/sendnew N — только новым\n/send N @user — одному\n/remind N — неответившим\n\n"
+                  "<b>Рассылки:</b>\n/broadcast N — анонс всем\n/sendnew N — только новым\n/send N @user — одному\n/remind N — неответившим\n/remindall N — напоминание ВСЕМ\n\n"
                   "<b>Участники:</b>\n/sync — обновить таблицу\n/remove @user — удалить из бота\n/link — ссылка на бота\n")
         send_message(cid, h)
     else:

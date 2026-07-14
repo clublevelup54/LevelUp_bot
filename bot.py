@@ -1,26 +1,29 @@
 """
-LEVEL UP — Telegram-бот для мероприятий (v2)
+LEVEL UP — Telegram-бот для мероприятий (v4)
 =============================================
-Многоивентовая версия:
-- Создание нескольких мероприятий через Telegram
-- Отдельная страница статистики по каждому мероприятию
-- Фамилии на странице статистики, имена в Telegram
-- Кнопка «Подробнее» для описания мероприятия
-- Рассылка анонсов по каждому мероприятию отдельно
+- Автоархивация прошедших мероприятий
+- Нумерация активных с 1
+- Архив со статистикой на веб-странице
 
 Команды админа:
-  /newevent    — создать новое мероприятие
-  /events      — список всех мероприятий
-  /broadcast N — разослать напоминание по мероприятию #N
-  /stats N     — статистика по мероприятию #N
-  /sync        — загрузить контакты из Google-таблицы
-  /link        — ссылка на бота
-  /help        — все команды
+  /newevent          — создать мероприятие
+  /events            — активные мероприятия
+  /archive           — архив прошедших
+  /broadcast N       — анонс всем
+  /send N @user      — одному человеку
+  /sendnew N         — только новым
+  /remind N          — напоминание неответившим
+  /edit N            — редактировать
+  /stats N           — статистика
+  /sync              — обновить Google-таблицу
+  /link              — ссылка на бота
+  /cleanup           — архивировать прошедшие вручную
+  /help              — все команды
 """
 
-import os, io, csv, json, sqlite3, threading, time, requests
-from datetime import datetime
-from flask import Flask, jsonify, render_template_string, redirect
+import os, io, csv, json, sqlite3, threading, time, requests, re
+from datetime import datetime, date
+from flask import Flask, jsonify, render_template_string
 
 BOT_TOKEN = "8898623835:AAGqfdD2vNcH4kWfZfqEV4PgufezS9R5Xwk"
 ADMIN_CHAT_ID = 173317122
@@ -29,715 +32,635 @@ SHEET_CSV_URL = "https://docs.google.com/spreadsheets/d/1FEV3V5zjDQ7D8yGfMMhocQj
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 DB_FILE = "levelup_bot.db"
 WEB_PORT = int(os.environ.get("PORT", 5000))
-
-# Хранилище состояний для создания мероприятий (в памяти)
 admin_state = {}
+
+MONTHS_RU = {"января":1,"февраля":2,"марта":3,"апреля":4,"мая":5,"июня":6,
+             "июля":7,"августа":8,"сентября":9,"октября":10,"ноября":11,"декабря":12}
+
+def parse_ru_date(text):
+    """Парсит '13 июля' или '13 июля 2026' → date"""
+    text = text.strip().lower()
+    m = re.match(r"(\d{1,2})\s+(\S+)(?:\s+(\d{4}))?", text)
+    if m:
+        day = int(m.group(1))
+        month_word = m.group(2)
+        year = int(m.group(3)) if m.group(3) else date.today().year
+        month = MONTHS_RU.get(month_word)
+        if month:
+            try:
+                d = date(year, month, day)
+                if not m.group(3) and d < date.today():
+                    d = date(year + 1, month, day)
+                return d
+            except: pass
+    return None
 
 # ═══════════════════════════════════════════
 # БАЗА ДАННЫХ
 # ═══════════════════════════════════════════
 def get_db():
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
-    return conn
+    conn = sqlite3.connect(DB_FILE); conn.row_factory = sqlite3.Row; return conn
 
 def init_db():
-    conn = get_db()
-    c = conn.cursor()
+    conn = get_db(); c = conn.cursor()
     c.execute("""CREATE TABLE IF NOT EXISTS contacts (
-        username TEXT PRIMARY KEY,
-        name TEXT,
-        last_name TEXT DEFAULT ''
-    )""")
+        username TEXT PRIMARY KEY, name TEXT, last_name TEXT DEFAULT '')""")
     c.execute("""CREATE TABLE IF NOT EXISTS users (
-        chat_id INTEGER PRIMARY KEY,
-        first_name TEXT,
-        last_name TEXT,
-        username TEXT,
-        joined_at TEXT
-    )""")
+        chat_id INTEGER PRIMARY KEY, first_name TEXT, last_name TEXT, username TEXT, joined_at TEXT)""")
     c.execute("CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)")
     c.execute("""CREATE TABLE IF NOT EXISTS events (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT,
-        date TEXT,
-        time TEXT,
-        place TEXT,
-        description TEXT DEFAULT '',
-        created_at TEXT,
-        is_active INTEGER DEFAULT 1
-    )""")
+        id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, date TEXT, time TEXT,
+        place TEXT, description TEXT DEFAULT '', date_iso TEXT DEFAULT '',
+        created_at TEXT, is_active INTEGER DEFAULT 1)""")
     c.execute("""CREATE TABLE IF NOT EXISTS rsvp (
-        event_id INTEGER,
-        chat_id INTEGER,
-        status TEXT,
-        responded_at TEXT,
-        first_name TEXT,
-        last_name TEXT,
-        username TEXT,
-        PRIMARY KEY (event_id, chat_id)
-    )""")
-    conn.commit()
-    conn.close()
+        event_id INTEGER, chat_id INTEGER, status TEXT, responded_at TEXT,
+        first_name TEXT, last_name TEXT, username TEXT, PRIMARY KEY (event_id, chat_id))""")
+    c.execute("""CREATE TABLE IF NOT EXISTS sent_log (
+        event_id INTEGER, chat_id INTEGER, sent_at TEXT, PRIMARY KEY (event_id, chat_id))""")
+    conn.commit(); conn.close()
+
+# ═══════════════════════════════════════════
+# АВТОАРХИВАЦИЯ
+# ═══════════════════════════════════════════
+def auto_archive():
+    """Переводит прошедшие мероприятия в архив"""
+    conn = get_db(); c = conn.cursor()
+    c.execute("SELECT id, date, date_iso FROM events WHERE is_active=1")
+    today = date.today(); archived = 0
+    for row in c.fetchall():
+        d = None
+        if row["date_iso"]:
+            try: d = date.fromisoformat(row["date_iso"])
+            except: pass
+        if not d:
+            d = parse_ru_date(row["date"])
+        if d and d < today:
+            c.execute("UPDATE events SET is_active=0 WHERE id=?", (row["id"],))
+            archived += 1
+    conn.commit(); conn.close()
+    return archived
+
+def archive_loop():
+    """Фоновый цикл — проверяет каждый час"""
+    while True:
+        try: auto_archive()
+        except: pass
+        time.sleep(3600)
 
 # ═══════════════════════════════════════════
 # МЕРОПРИЯТИЯ
 # ═══════════════════════════════════════════
-def create_event(name, date, time_str, place, description=""):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("INSERT INTO events (name, date, time, place, description, created_at) VALUES (?,?,?,?,?,?)",
-              (name, date, time_str, place, description, datetime.now().isoformat()))
-    event_id = c.lastrowid
-    conn.commit()
-    conn.close()
-    return event_id
-
-def get_event(event_id):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT * FROM events WHERE id=?", (event_id,))
-    row = c.fetchone()
-    conn.close()
-    if row:
-        return dict(row)
-    return None
-
-def get_all_events():
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT * FROM events ORDER BY id DESC")
-    rows = [dict(r) for r in c.fetchall()]
-    conn.close()
+def get_active_events():
+    conn = get_db(); c = conn.cursor()
+    c.execute("SELECT * FROM events WHERE is_active=1 ORDER BY id ASC")
+    rows = [dict(r) for r in c.fetchall()]; conn.close()
+    # Присваиваем отображаемые номера 1, 2, 3...
+    for i, e in enumerate(rows): e["display_num"] = i + 1
     return rows
 
-def get_latest_event():
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT * FROM events WHERE is_active=1 ORDER BY id DESC LIMIT 1")
-    row = c.fetchone()
-    conn.close()
-    if row:
-        return dict(row)
+def get_archived_events():
+    conn = get_db(); c = conn.cursor()
+    c.execute("SELECT * FROM events WHERE is_active=0 ORDER BY id DESC")
+    rows = [dict(r) for r in c.fetchall()]; conn.close()
+    return rows
+
+def get_event_by_display_num(num):
+    """Находит активное мероприятие по отображаемому номеру (1, 2, 3...)"""
+    events = get_active_events()
+    if 1 <= num <= len(events):
+        return events[num - 1]
     return None
 
+def get_event(eid):
+    conn = get_db(); c = conn.cursor()
+    c.execute("SELECT * FROM events WHERE id=?", (eid,))
+    r = c.fetchone(); conn.close()
+    return dict(r) if r else None
+
+def create_event(name, date_str, time_str, place, description=""):
+    date_iso = ""
+    d = parse_ru_date(date_str)
+    if d: date_iso = d.isoformat()
+    conn = get_db(); c = conn.cursor()
+    c.execute("INSERT INTO events (name,date,time,place,description,date_iso,created_at) VALUES (?,?,?,?,?,?,?)",
+              (name, date_str, time_str, place, description, date_iso, datetime.now().isoformat()))
+    eid = c.lastrowid; conn.commit(); conn.close()
+    return eid
+
+def update_event_field(eid, field, value):
+    conn = get_db(); c = conn.cursor()
+    c.execute(f"UPDATE events SET {field}=? WHERE id=?", (value, eid))
+    if field == "date":
+        d = parse_ru_date(value)
+        if d: c.execute("UPDATE events SET date_iso=? WHERE id=?", (d.isoformat(), eid))
+    conn.commit(); conn.close()
+
+def get_latest_event():
+    conn = get_db(); c = conn.cursor()
+    c.execute("SELECT * FROM events WHERE is_active=1 ORDER BY id DESC LIMIT 1")
+    r = c.fetchone(); conn.close()
+    return dict(r) if r else None
+
+def resolve_event_num(text_parts):
+    """Из '/broadcast 2' достаёт реальный event_id по отображаемому номеру"""
+    if len(text_parts) < 2:
+        e = get_latest_event()
+        return e["id"] if e else None
+    try:
+        num = int(text_parts[1])
+        e = get_event_by_display_num(num)
+        return e["id"] if e else None
+    except: return None
+
 # ═══════════════════════════════════════════
-# КОНТАКТЫ И ПОЛЬЗОВАТЕЛИ
+# КОНТАКТЫ
 # ═══════════════════════════════════════════
 def sync_google_sheet():
-    if not SHEET_CSV_URL:
-        return 0, "URL таблицы не указан"
+    if not SHEET_CSV_URL: return 0, "URL не указан"
     try:
-        r = requests.get(SHEET_CSV_URL, timeout=10)
-        r.encoding = "utf-8"
-        reader = csv.reader(io.StringIO(r.text))
-        header = next(reader, None)
-        conn = get_db()
-        c = conn.cursor()
-        count = 0
+        r = requests.get(SHEET_CSV_URL, timeout=10); r.encoding = "utf-8"
+        reader = csv.reader(io.StringIO(r.text)); next(reader, None)
+        conn = get_db(); c = conn.cursor(); count = 0
         for row in reader:
-            if len(row) >= 2:
-                name_full = row[0].strip()
-                username = row[1].strip().replace("@", "").lower()
-                # Разделяем имя и фамилию
-                parts = name_full.split(None, 1)
-                first = parts[0] if parts else name_full
-                last = parts[1] if len(parts) > 1 else ""
+            if len(row) >= 3:
+                last_name = row[0].strip()   # A — фамилия
+                first_name = row[1].strip()   # B — имя (для обращения)
+                username = row[2].strip().replace("@","").lower()  # C — username
                 if username:
-                    c.execute("INSERT OR REPLACE INTO contacts (username, name, last_name) VALUES (?,?,?)",
-                              (username, first, last))
-                    count += 1
-        conn.commit()
-        conn.close()
-        return count, "OK"
-    except Exception as e:
-        return 0, str(e)
+                    c.execute("INSERT OR REPLACE INTO contacts (username,name,last_name) VALUES (?,?,?)",
+                              (username, first_name, last_name)); count += 1
+            elif len(row) >= 2:
+                # Обратная совместимость: 2 столбца (имя, username)
+                name = row[0].strip()
+                username = row[1].strip().replace("@","").lower()
+                if username:
+                    c.execute("INSERT OR REPLACE INTO contacts (username,name,last_name) VALUES (?,?,?)",
+                              (username, name, "")); count += 1
+        conn.commit(); conn.close(); return count, "OK"
+    except Exception as e: return 0, str(e)
 
-def add_user(chat_id, first_name, last_name, username):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("""INSERT OR REPLACE INTO users (chat_id, first_name, last_name, username, joined_at)
-                 VALUES (?,?,?,?,?)""",
-              (chat_id, first_name, last_name or "",
-               (username or "").lower(), datetime.now().isoformat()))
-    conn.commit()
-    conn.close()
+def add_user(cid, fn, ln, un):
+    conn = get_db(); c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO users (chat_id,first_name,last_name,username,joined_at) VALUES (?,?,?,?,?)",
+              (cid, fn, ln or "", (un or "").lower(), datetime.now().isoformat()))
+    conn.commit(); conn.close()
 
 def get_all_active_users():
-    conn = get_db()
-    c = conn.cursor()
+    """Только те пользователи, которые есть в Google-таблице"""
+    conn = get_db(); c = conn.cursor()
+    c.execute("""SELECT u.chat_id, u.first_name, u.last_name, u.username FROM users u
+                 INNER JOIN contacts c ON LOWER(u.username) = LOWER(c.username)""")
+    u = [dict(r) for r in c.fetchall()]; conn.close(); return u
+
+def get_all_bot_users():
+    """Все, кто писал боту (для статистики)"""
+    conn = get_db(); c = conn.cursor()
     c.execute("SELECT chat_id, first_name, last_name, username FROM users")
-    users = [dict(r) for r in c.fetchall()]
-    conn.close()
-    return users
+    u = [dict(r) for r in c.fetchall()]; conn.close(); return u
 
-def save_rsvp(event_id, chat_id, status, first_name, last_name, username):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("""INSERT OR REPLACE INTO rsvp (event_id, chat_id, status, responded_at, first_name, last_name, username)
-                 VALUES (?,?,?,?,?,?,?)""",
-              (event_id, chat_id, status, datetime.now().isoformat(), first_name, last_name or "", username))
-    conn.commit()
-    conn.close()
+def get_user_by_username(uname):
+    conn = get_db(); c = conn.cursor()
+    c.execute("SELECT * FROM users WHERE LOWER(username)=?", (uname.lower().replace("@",""),))
+    r = c.fetchone(); conn.close(); return dict(r) if r else None
 
-def get_event_stats(event_id):
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT COUNT(*) as cnt FROM users")
-    total_active = c.fetchone()["cnt"]
-    c.execute("SELECT COUNT(*) as cnt FROM contacts")
-    total_contacts = c.fetchone()["cnt"]
-    c.execute("SELECT COUNT(*) as cnt FROM rsvp WHERE event_id=? AND status='going'", (event_id,))
-    going = c.fetchone()["cnt"]
-    c.execute("SELECT COUNT(*) as cnt FROM rsvp WHERE event_id=? AND status='not_going'", (event_id,))
-    not_going = c.fetchone()["cnt"]
-    c.execute("""SELECT first_name, last_name, username, status, responded_at
-                 FROM rsvp WHERE event_id=? ORDER BY responded_at DESC""", (event_id,))
-    responses = [dict(r) for r in c.fetchall()]
-    c.execute("""SELECT c.name, c.last_name as contact_last, c.username FROM contacts c
-                 LEFT JOIN users u ON LOWER(c.username) = LOWER(u.username)
-                 WHERE u.chat_id IS NULL""")
-    not_activated = [dict(r) for r in c.fetchall()]
-    event = get_event(event_id)
-    conn.close()
-    return {
-        "event": event,
-        "total_contacts": total_contacts,
-        "total_active": total_active,
-        "going": going,
-        "not_going": not_going,
-        "no_response": total_active - going - not_going,
-        "responses": responses,
-        "not_activated": not_activated,
-        "not_activated_count": len(not_activated)
-    }
+def get_contact_name(username):
+    """Берёт имя из Google-таблицы по username, если есть"""
+    if not username: return None
+    conn = get_db(); c = conn.cursor()
+    c.execute("SELECT name FROM contacts WHERE LOWER(username)=?", (username.lower().replace("@",""),))
+    r = c.fetchone(); conn.close()
+    return r["name"] if r else None
+
+def get_display_name(fn, username):
+    """Имя из таблицы, если есть. Иначе — из Telegram"""
+    name = get_contact_name(username)
+    return name if name else fn
+
+def log_sent(eid, cid):
+    conn = get_db(); c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO sent_log (event_id,chat_id,sent_at) VALUES (?,?,?)", (eid,cid,datetime.now().isoformat()))
+    conn.commit(); conn.close()
+
+def get_unsent_users(eid):
+    conn = get_db(); c = conn.cursor()
+    c.execute("SELECT u.chat_id,u.first_name,u.last_name,u.username FROM users u LEFT JOIN sent_log s ON u.chat_id=s.chat_id AND s.event_id=? WHERE s.chat_id IS NULL", (eid,))
+    u = [dict(r) for r in c.fetchall()]; conn.close(); return u
+
+def get_no_response_users(eid):
+    conn = get_db(); c = conn.cursor()
+    c.execute("SELECT u.chat_id,u.first_name,u.last_name,u.username FROM users u LEFT JOIN rsvp r ON u.chat_id=r.chat_id AND r.event_id=? WHERE r.chat_id IS NULL", (eid,))
+    u = [dict(r) for r in c.fetchall()]; conn.close(); return u
+
+def save_rsvp(eid, cid, status, fn, ln, un):
+    conn = get_db(); c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO rsvp (event_id,chat_id,status,responded_at,first_name,last_name,username) VALUES (?,?,?,?,?,?,?)",
+              (eid,cid,status,datetime.now().isoformat(),fn,ln or "",un))
+    conn.commit(); conn.close()
+
+def get_event_stats(eid):
+    conn = get_db(); c = conn.cursor()
+    c.execute("SELECT COUNT(*) as cnt FROM users"); ta = c.fetchone()["cnt"]
+    c.execute("SELECT COUNT(*) as cnt FROM contacts"); tc = c.fetchone()["cnt"]
+    c.execute("SELECT COUNT(*) as cnt FROM rsvp WHERE event_id=? AND status='going'", (eid,)); g = c.fetchone()["cnt"]
+    c.execute("SELECT COUNT(*) as cnt FROM rsvp WHERE event_id=? AND status='not_going'", (eid,)); ng = c.fetchone()["cnt"]
+    c.execute("SELECT first_name,last_name,username,status,responded_at FROM rsvp WHERE event_id=? ORDER BY last_name ASC, first_name ASC", (eid,))
+    resp = [dict(r) for r in c.fetchall()]
+    c.execute("SELECT c.name,c.last_name as contact_last,c.username FROM contacts c LEFT JOIN users u ON LOWER(c.username)=LOWER(u.username) WHERE u.chat_id IS NULL")
+    na = [dict(r) for r in c.fetchall()]; conn.close()
+    return {"event":get_event(eid),"total_contacts":tc,"total_active":ta,"going":g,"not_going":ng,
+            "no_response":ta-g-ng,"responses":resp,"not_activated":na,"not_activated_count":len(na)}
 
 # ═══════════════════════════════════════════
-# TELEGRAM API
+# TELEGRAM
 # ═══════════════════════════════════════════
-def send_message(chat_id, text, reply_markup=None):
-    data = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
-    if reply_markup:
-        data["reply_markup"] = json.dumps(reply_markup)
-    try:
-        r = requests.post(f"{API}/sendMessage", json=data, timeout=10)
-        return r.json()
-    except:
-        return {"ok": False}
+def send_message(cid, text, reply_markup=None):
+    data = {"chat_id":cid,"text":text,"parse_mode":"HTML"}
+    if reply_markup: data["reply_markup"] = json.dumps(reply_markup)
+    try: return requests.post(f"{API}/sendMessage", json=data, timeout=10).json()
+    except: return {"ok":False}
 
-def answer_callback(callback_query_id, text):
-    try:
-        requests.post(f"{API}/answerCallbackQuery", json={
-            "callback_query_id": callback_query_id,
-            "text": text,
-            "show_alert": True
-        }, timeout=10)
-    except:
-        pass
+def answer_callback(cbid, text):
+    try: requests.post(f"{API}/answerCallbackQuery", json={"callback_query_id":cbid,"text":text,"show_alert":True}, timeout=10)
+    except: pass
 
 def get_bot_username():
     try:
-        r = requests.get(f"{API}/getMe", timeout=10)
-        data = r.json()
-        if data.get("ok"):
-            return data["result"].get("username", "")
-    except:
-        pass
+        r = requests.get(f"{API}/getMe", timeout=10).json()
+        if r.get("ok"): return r["result"].get("username","")
+    except: pass
     return ""
 
-def make_event_keyboard(event_id):
-    return {
-        "inline_keyboard": [
-            [
-                {"text": "✅ ИДУ НА ВСТРЕЧУ", "callback_data": f"rsvp_going_{event_id}"},
-                {"text": "❌ НЕ СМОГУ", "callback_data": f"rsvp_not_{event_id}"}
-            ],
-            [
-                {"text": "📋 Подробнее о мероприятии", "callback_data": f"details_{event_id}"}
-            ]
-        ]
-    }
+def make_kb(eid):
+    return {"inline_keyboard":[
+        [{"text":"✅ ИДУ НА ВСТРЕЧУ","callback_data":f"go_{eid}"},{"text":"❌ НЕ СМОГУ","callback_data":f"no_{eid}"}],
+        [{"text":"📋 Подробнее о мероприятии","callback_data":f"info_{eid}"}]]}
 
-def make_event_text(event):
-    return (
-        f"📌 <b>{event['name']}</b>\n"
-        f"📅 {event['date']} в {event['time']}\n"
-        f"📍 {event['place']}\n"
-        f"🏛 Мужской клуб предпринимателей Level Up"
-    )
+def etxt(e):
+    return f"📌 <b>{e['name']}</b>\n📅 {e['date']} в {e['time']}\n📍 {e['place']}"
 
-def broadcast_event(event_id):
-    sync_google_sheet()
-    event = get_event(event_id)
-    if not event:
-        return 0, 0
-    users = get_all_active_users()
-    text = (
-        f"🔔 <b>Приглашение на встречу</b>\n\n"
-        f"{make_event_text(event)}\n\n"
-        f"Вы придёте?"
-    )
-    keyboard = make_event_keyboard(event_id)
-    sent = 0
-    errors = 0
-    for user in users:
-        if user["chat_id"] == ADMIN_CHAT_ID:
-            continue
-        result = send_message(user["chat_id"], text, keyboard)
-        if result.get("ok"):
-            sent += 1
-        else:
-            errors += 1
+def send_event_to_user(eid, user):
+    e = get_event(eid)
+    if not e: return False
+    result = send_message(user["chat_id"], f"🔔 <b>Приглашение на встречу</b>\n\n{etxt(e)}\n\nТы придёшь?", make_kb(eid))
+    if result.get("ok"): log_sent(eid, user["chat_id"]); return True
+    return False
+
+def broadcast_event(eid, users=None):
+    sync_google_sheet(); e = get_event(eid)
+    if not e: return 0,0
+    if users is None: users = get_all_active_users()
+    sent=errors=0
+    for u in users:
+        if send_event_to_user(eid, u): sent+=1
+        else: errors+=1
+        time.sleep(0.05)
+    return sent, errors
+
+def send_reminder(eid):
+    e = get_event(eid)
+    if not e: return 0,0
+    users = get_no_response_users(eid)
+    sent=errors=0
+    for u in users:
+        result = send_message(u["chat_id"], f"⏰ <b>Напоминание!</b>\n\nТы ещё не ответил(а):\n\n{etxt(e)}\n\nПридёшь?", make_kb(eid))
+        if result.get("ok"): sent+=1
+        else: errors+=1
         time.sleep(0.05)
     return sent, errors
 
 # ═══════════════════════════════════════════
-# ОБРАБОТКА ОБНОВЛЕНИЙ
+# ОБРАБОТКА
 # ═══════════════════════════════════════════
 def handle_update(update):
-    # Кнопки
     if "callback_query" in update:
-        cb = update["callback_query"]
-        chat_id = cb["from"]["id"]
-        first_name = cb["from"].get("first_name", "")
-        last_name = cb["from"].get("last_name", "")
-        username = cb["from"].get("username", "")
-        data = cb.get("data", "")
+        cb = update["callback_query"]; cid = cb["from"]["id"]
+        fn = cb["from"].get("first_name",""); ln = cb["from"].get("last_name","")
+        un = cb["from"].get("username",""); data = cb.get("data","")
 
-        if data.startswith("rsvp_going_"):
-            event_id = int(data.replace("rsvp_going_", ""))
-            event = get_event(event_id)
-            save_rsvp(event_id, chat_id, "going", first_name, last_name, username)
-            answer_callback(cb["id"], "🎉 Отлично! Вы записаны на встречу!")
-            if event:
-                send_message(chat_id,
-                    f"✅ <b>{first_name}, вы записаны!</b>\n\n"
-                    f"📅 {event['date']} в {event['time']}\n"
-                    f"📍 {event['place']}\n\nДо встречи!")
-                send_message(ADMIN_CHAT_ID,
-                    f"✅ <b>{first_name} {last_name}</b> (@{username}) идёт на «{event['name']}»!")
+        # Кнопки напоминаний (админ)
+        if data.startswith("stdremind_") and cid == ADMIN_CHAT_ID:
+            eid = int(data[10:]); answer_callback(cb["id"],"Отправляю...")
+            sent,err = send_reminder(eid)
+            send_message(cid, f"✅ Напоминание отправлено!\n📨 {sent} · ⚠️ {err}"); return
+        if data.startswith("custremind_") and cid == ADMIN_CHAT_ID:
+            eid = int(data[11:])
+            admin_state[cid] = {"action":"custom_remind","step":"text","event_id":eid}
+            answer_callback(cb["id"],""); send_message(cid,"✏️ Напишите текст напоминания:\n\n/cancel — отменить"); return
 
-        elif data.startswith("rsvp_not_"):
-            event_id = int(data.replace("rsvp_not_", ""))
-            event = get_event(event_id)
-            save_rsvp(event_id, chat_id, "not_going", first_name, last_name, username)
-            answer_callback(cb["id"], "Жаль! Ждём на следующей встрече.")
-            send_message(chat_id,
-                f"{first_name}, понял — в этот раз не получится. "
-                "Будем рады видеть вас на следующей встрече! 🤝")
-            if event:
-                send_message(ADMIN_CHAT_ID,
-                    f"❌ <b>{first_name} {last_name}</b> (@{username}) не сможет прийти на «{event['name']}».")
-
-        elif data.startswith("details_"):
-            event_id = int(data.replace("details_", ""))
-            event = get_event(event_id)
-            if event and event.get("description"):
-                send_message(chat_id,
-                    f"📋 <b>{event['name']}</b>\n\n"
-                    f"{event['description']}\n\n"
-                    f"📅 {event['date']} в {event['time']}\n"
-                    f"📍 {event['place']}")
-            elif event:
-                send_message(chat_id,
-                    f"📋 <b>{event['name']}</b>\n\n"
-                    f"📅 {event['date']} в {event['time']}\n"
-                    f"📍 {event['place']}\n\n"
-                    f"Подробное описание пока не добавлено.")
-            answer_callback(cb["id"], "")
+        if data.startswith("go_"):
+            eid = int(data[3:]); e = get_event(eid)
+            save_rsvp(eid,cid,"going",fn,ln,un); answer_callback(cb["id"],"🎉 Ты записан(а)!")
+            if e:
+                name = get_display_name(fn, un)
+                send_message(cid, f"✅ <b>{name}, ты записан(а)!</b>\n\n📅 {e['date']} в {e['time']}\n📍 {e['place']}\n\nДо встречи!")
+                send_message(ADMIN_CHAT_ID, f"✅ <b>{fn} {ln}</b> (@{un}) идёт на «{e['name']}»!")
+        elif data.startswith("no_"):
+            eid = int(data[3:]); e = get_event(eid)
+            save_rsvp(eid,cid,"not_going",fn,ln,un); answer_callback(cb["id"],"Жаль!")
+            name = get_display_name(fn, un)
+            send_message(cid, f"{name}, понял — в этот раз не получится. Ждём на следующей! 🤝")
+            if e: send_message(ADMIN_CHAT_ID, f"❌ <b>{fn} {ln}</b> (@{un}) не сможет — «{e['name']}»")
+        elif data.startswith("info_"):
+            eid = int(data[5:]); e = get_event(eid)
+            if e and e.get("description"):
+                send_message(cid, f"📋 <b>{e['name']}</b>\n\n{e['description']}\n\n📅 {e['date']} в {e['time']}\n📍 {e['place']}")
+            elif e:
+                send_message(cid, f"📋 <b>{e['name']}</b>\n\n📅 {e['date']} в {e['time']}\n📍 {e['place']}\n\nОписание пока не добавлено.")
+            answer_callback(cb["id"],"")
         return
 
-    # Сообщения
     msg = update.get("message")
-    if not msg:
-        return
+    if not msg: return
+    cid=msg["chat"]["id"]; fn=msg["from"].get("first_name","")
+    ln=msg["from"].get("last_name",""); un=msg["from"].get("username","")
+    text=msg.get("text","").strip(); add_user(cid,fn,ln,un)
 
-    chat_id = msg["chat"]["id"]
-    first_name = msg["from"].get("first_name", "")
-    last_name = msg["from"].get("last_name", "")
-    username = msg["from"].get("username", "")
-    text = msg.get("text", "").strip()
+    # ── Состояния ──
+    if cid == ADMIN_CHAT_ID and cid in admin_state:
+        st = admin_state[cid]; step = st.get("step"); action = st.get("action","create")
+        if text == "/cancel": del admin_state[cid]; send_message(cid,"❌ Отменено."); return
 
-    add_user(chat_id, first_name, last_name, username)
+        if action == "create":
+            if step=="name": st["name"]=text; st["step"]="date"; send_message(cid,"📅 <b>Дата</b>\n\n<i>Например: 15 августа</i>"); return
+            elif step=="date": st["date"]=text; st["step"]="time"; send_message(cid,"🕐 <b>Время</b>\n\n<i>Например: 18:00</i>"); return
+            elif step=="time": st["time"]=text; st["step"]="place"; send_message(cid,"📍 <b>Место</b>\n\n<i>Например: Азимут, ул. Ленина 21</i>"); return
+            elif step=="place": st["place"]=text; st["step"]="description"; send_message(cid,"📝 <b>Подробное описание</b> для кнопки «Подробнее».\n\nЕсли пока нет — отправьте <b>-</b>"); return
+            elif step=="description":
+                desc = "" if text=="-" else text
+                eid = create_event(st["name"],st["date"],st["time"],st["place"],desc)
+                evts = get_active_events(); dnum = next((e["display_num"] for e in evts if e["id"]==eid), "?")
+                del admin_state[cid]
+                send_message(cid, f"✅ <b>Мероприятие #{dnum} создано!</b>\n\n📌 {st['name']}\n📅 {st['date']} в {st['time']}\n📍 {st['place']}\n\nАнонс: <code>/broadcast {dnum}</code>\nСтатистика: <code>/stats {dnum}</code>"); return
 
-    # ── Состояние создания мероприятия ──
-    if chat_id == ADMIN_CHAT_ID and chat_id in admin_state:
-        state = admin_state[chat_id]
-        step = state.get("step")
+        elif action == "edit":
+            if step=="choose_field":
+                fm={"1":"name","2":"date","3":"time","4":"place","5":"description"}
+                if text in fm:
+                    st["field"]=fm[text]; st["step"]="new_value"
+                    labels={"name":"название","date":"дату","time":"время","place":"место","description":"описание"}
+                    send_message(cid, f"✏️ Введите новое <b>{labels[fm[text]]}</b>:")
+                else: send_message(cid,"Введите число 1-5")
+                return
+            elif step=="new_value":
+                update_event_field(st["event_id"], st["field"], text)
+                e = get_event(st["event_id"]); del admin_state[cid]
+                send_message(cid, f"✅ Обновлено!\n\n{etxt(e)}"); return
 
-        if step == "name":
-            state["name"] = text
-            state["step"] = "date"
-            send_message(chat_id, "📅 Введите <b>дату</b> мероприятия\n\n<i>Например: 15 августа</i>")
-            return
-        elif step == "date":
-            state["date"] = text
-            state["step"] = "time"
-            send_message(chat_id, "🕐 Введите <b>время</b> начала\n\n<i>Например: 18:00</i>")
-            return
-        elif step == "time":
-            state["time"] = text
-            state["step"] = "place"
-            send_message(chat_id, "📍 Введите <b>место</b> проведения\n\n<i>Например: Азимут, ул. Ленина 21</i>")
-            return
-        elif step == "place":
-            state["place"] = text
-            state["step"] = "description"
-            send_message(chat_id,
-                "📝 Введите <b>подробное описание</b> мероприятия.\n\n"
-                "Это текст, который увидят участники при нажатии кнопки «Подробнее».\n\n"
-                "Можно использовать несколько строк. Если описания пока нет — отправьте <b>-</b>")
-            return
-        elif step == "description":
-            desc = "" if text == "-" else text
-            event_id = create_event(state["name"], state["date"], state["time"], state["place"], desc)
-            del admin_state[chat_id]
-            send_message(chat_id,
-                f"✅ <b>Мероприятие #{event_id} создано!</b>\n\n"
-                f"📌 {state['name']}\n"
-                f"📅 {state['date']} в {state['time']}\n"
-                f"📍 {state['place']}\n\n"
-                f"Чтобы разослать анонс:\n"
-                f"<code>/broadcast {event_id}</code>\n\n"
-                f"Чтобы посмотреть статистику:\n"
-                f"<code>/stats {event_id}</code>")
-            return
+        elif action == "custom_remind":
+            if step=="text":
+                eid=st["event_id"]; e=get_event(eid); users=get_no_response_users(eid)
+                sent=errors=0
+                for u in users:
+                    result = send_message(u["chat_id"], f"⏰ <b>Напоминание</b>\n\n{etxt(e)}\n\n{text}", make_kb(eid))
+                    if result.get("ok"): sent+=1
+                    else: errors+=1
+                    time.sleep(0.05)
+                del admin_state[cid]; send_message(cid, f"✅ Напоминание отправлено!\n📨 {sent} · ⚠️ {errors}"); return
 
     # ── Команды ──
     if text == "/start":
-        event = get_latest_event()
-        if event:
-            send_message(chat_id,
-                f"👋 Привет, <b>{first_name}</b>!\n\n"
-                f"Это бот <b>Мужского клуба предпринимателей Level Up</b>.\n\n"
-                f"Ближайшее мероприятие:\n"
-                f"{make_event_text(event)}\n\n"
-                f"Вы планируете прийти?",
-                make_event_keyboard(event["id"])
-            )
-        else:
-            send_message(chat_id,
-                f"👋 Привет, <b>{first_name}</b>!\n\n"
-                f"Это бот <b>Мужского клуба предпринимателей Level Up</b>.\n\n"
-                f"Пока мероприятий нет — я пришлю уведомление, когда появится новая встреча.")
-
-    elif text == "/newevent" and chat_id == ADMIN_CHAT_ID:
-        admin_state[chat_id] = {"step": "name"}
-        send_message(chat_id,
-            "🆕 <b>Создание нового мероприятия</b>\n\n"
-            "Введите <b>название</b> мероприятия\n\n"
-            "<i>Например: АПЕКС — Точка идеального поворота</i>")
-
-    elif text == "/cancel" and chat_id == ADMIN_CHAT_ID:
-        if chat_id in admin_state:
-            del admin_state[chat_id]
-            send_message(chat_id, "❌ Создание мероприятия отменено.")
-        else:
-            send_message(chat_id, "Нечего отменять.")
-
-    elif text == "/events" and chat_id == ADMIN_CHAT_ID:
-        events = get_all_events()
-        if not events:
-            send_message(chat_id, "Мероприятий пока нет. Создайте: /newevent")
+        e = get_latest_event(); name = get_display_name(fn, un)
+        # Проверяем, есть ли человек в Google-таблице (резидент клуба)
+        is_contact = get_contact_name(un) is not None if un else False
+        if not is_contact:
+            send_message(cid,
+                "Наш чат-бот только для резидентов мужского клуба предпринимателей Level Up.\n\n"
+                "Если вы уже присоединились к нашему бизнес-клубу, "
+                "напишите Службе заботы @Zabotalevelup и мы зарегистрируем вас в нашем чат-боте.\n\n"
+                "До встречи!")
             return
-        msg_text = "📋 <b>Все мероприятия:</b>\n\n"
-        for e in events:
-            stats = get_event_stats(e["id"])
-            msg_text += (
-                f"<b>#{e['id']}</b> {e['name']}\n"
-                f"   📅 {e['date']} в {e['time']} · 📍 {e['place']}\n"
-                f"   ✅ {stats['going']} идут · ❌ {stats['not_going']} не смогут\n\n"
-            )
-        msg_text += (
-            "<b>Команды:</b>\n"
-            "<code>/broadcast N</code> — разослать анонс\n"
-            "<code>/stats N</code> — статистика"
-        )
-        send_message(chat_id, msg_text)
+        if e: send_message(cid, f"👋 Привет, <b>{name}</b>!\n\nНаше ближайшее мероприятие мужского клуба предпринимателей Level Up:\n\n{etxt(e)}\n\nТы придёшь?", make_kb(e["id"]))
+        else: send_message(cid, f"👋 Привет, <b>{name}</b>!\n\nЭто бот мужского клуба предпринимателей Level Up.\n\nПока мероприятий нет — я пришлю уведомление, когда появится.")
 
-    elif text.startswith("/broadcast") and chat_id == ADMIN_CHAT_ID:
+    elif text == "/newevent" and cid == ADMIN_CHAT_ID:
+        admin_state[cid] = {"action":"create","step":"name"}
+        send_message(cid,"🆕 <b>Новое мероприятие</b>\n\nВведите <b>название</b>\n\n/cancel — отменить")
+
+    elif text.startswith("/edit") and cid == ADMIN_CHAT_ID:
         parts = text.split()
-        if len(parts) < 2:
-            event = get_latest_event()
-            if event:
-                send_message(chat_id,
-                    f"📤 Рассылка по последнему мероприятию <b>#{event['id']}</b>: {event['name']}...")
-                sent, errors = broadcast_event(event["id"])
-            else:
-                send_message(chat_id, "Нет мероприятий. Создайте: /newevent")
-                return
-        else:
-            try:
-                event_id = int(parts[1])
-                event = get_event(event_id)
-                if not event:
-                    send_message(chat_id, f"❌ Мероприятие #{event_id} не найдено.")
-                    return
-                send_message(chat_id, f"📤 Рассылка по <b>#{event_id}</b>: {event['name']}...")
-                sent, errors = broadcast_event(event_id)
-            except ValueError:
-                send_message(chat_id, "Используйте: <code>/broadcast N</code> (N — номер мероприятия)")
-                return
+        eid = resolve_event_num(parts)
+        if not eid: send_message(cid,"❌ Мероприятие не найдено. Проверьте номер: /events"); return
+        e = get_event(eid)
+        admin_state[cid] = {"action":"edit","step":"choose_field","event_id":eid}
+        send_message(cid, f"✏️ <b>Редактирование: {e['name']}</b>\n\n<b>1</b> — Название: {e['name']}\n<b>2</b> — Дата: {e['date']}\n<b>3</b> — Время: {e['time']}\n<b>4</b> — Место: {e['place']}\n<b>5</b> — Описание\n\nОтправьте число (1-5) или /cancel")
 
-        stats = get_event_stats(event["id"] if "event" in dir() else event_id)
-        msg_text = f"✅ <b>Рассылка завершена!</b>\n\n📨 Отправлено: {sent}\n⚠️ Ошибок: {errors}"
-        if stats["not_activated"]:
-            msg_text += f"\n\n⏳ <b>Не подключились к боту ({stats['not_activated_count']}):</b>\n"
-            for c in stats["not_activated"][:20]:
-                msg_text += f"  • {c['name']} {c.get('contact_last','')} — @{c['username']}\n"
-        send_message(chat_id, msg_text)
+    elif text == "/events" and cid == ADMIN_CHAT_ID:
+        auto_archive()
+        evts = get_active_events()
+        if not evts: send_message(cid,"Активных мероприятий нет.\n\n/newevent — создать\n/archive — посмотреть прошедшие"); return
+        m = "📋 <b>Активные мероприятия:</b>\n\n"
+        for e in evts:
+            s = get_event_stats(e["id"])
+            m += f"<b>#{e['display_num']}</b> {e['name']}\n   📅 {e['date']} в {e['time']} · 📍 {e['place']}\n   ✅ {s['going']} · ❌ {s['not_going']}\n\n"
+        m += "<code>/broadcast N</code> — анонс\n<code>/remind N</code> — напоминание\n<code>/edit N</code> — редактировать"
+        send_message(cid, m)
 
-    elif text.startswith("/stats") and chat_id == ADMIN_CHAT_ID:
+    elif text == "/archive" and cid == ADMIN_CHAT_ID:
+        evts = get_archived_events()
+        if not evts: send_message(cid,"Архив пуст."); return
+        m = "📦 <b>Архив мероприятий:</b>\n\n"
+        for e in evts:
+            s = get_event_stats(e["id"])
+            m += f"📌 {e['name']}\n   📅 {e['date']} · ✅ {s['going']} · ❌ {s['not_going']}\n\n"
+        send_message(cid, m)
+
+    elif text.startswith("/broadcast") and cid == ADMIN_CHAT_ID:
+        parts = text.split(); eid = resolve_event_num(parts)
+        if not eid: send_message(cid,"❌ Не найдено. /events"); return
+        e = get_event(eid); send_message(cid, f"📤 Рассылка: {e['name']}...")
+        sent,err = broadcast_event(eid)
+        s = get_event_stats(eid); m = f"✅ <b>Рассылка завершена!</b>\n\n📨 {sent} · ⚠️ {err}"
+        if s["not_activated"]:
+            m += f"\n\n⏳ <b>Не в боте ({s['not_activated_count']}):</b>\n"
+            for c in s["not_activated"][:20]: m += f"  • {c['name']} {c.get('contact_last','')} — @{c['username']}\n"
+        send_message(cid, m)
+
+    elif text.startswith("/sendnew") and cid == ADMIN_CHAT_ID:
+        parts = text.split(); eid = resolve_event_num(parts)
+        if not eid: send_message(cid,"❌ Не найдено."); return
+        users = get_unsent_users(eid)
+        if not users: send_message(cid,"Все уже получили анонс."); return
+        send_message(cid, f"📤 Отправка новым ({len(users)})...")
+        sent,err = broadcast_event(eid, users)
+        send_message(cid, f"✅ Готово! {sent} отправлено, {err} ошибок")
+
+    elif text.startswith("/send ") and cid == ADMIN_CHAT_ID:
+        parts = text.split(None,2)
+        if len(parts)<3: send_message(cid,"<code>/send N @username</code>"); return
+        try: num = int(parts[1])
+        except: send_message(cid,"<code>/send N @username</code>"); return
+        e = get_event_by_display_num(num)
+        if not e: send_message(cid,"❌ Не найдено."); return
+        uname = parts[2].replace("@","").strip()
+        user = get_user_by_username(uname)
+        if not user: send_message(cid,f"❌ @{uname} не в боте."); return
+        ok = send_event_to_user(e["id"], user)
+        send_message(cid, f"✅ Отправлено @{uname}!" if ok else f"❌ Ошибка")
+
+    elif text.startswith("/remind") and cid == ADMIN_CHAT_ID:
+        parts = text.split(); eid = resolve_event_num(parts)
+        if not eid: send_message(cid,"❌ Не найдено."); return
+        e = get_event(eid); nr = get_no_response_users(eid)
+        if not nr: send_message(cid,"Все уже ответили! 🎉"); return
+        send_message(cid, f"⏰ <b>Напоминание: {e['name']}</b>\n\nНе ответили: {len(nr)} чел.",
+            {"inline_keyboard":[[
+                {"text":"📤 Стандартное","callback_data":f"stdremind_{eid}"},
+                {"text":"✏️ Свой текст","callback_data":f"custremind_{eid}"}]]})
+
+    elif text.startswith("/stats") and cid == ADMIN_CHAT_ID:
+        parts = text.split(); eid = resolve_event_num(parts)
+        if not eid: send_message(cid,"❌ Не найдено."); return
+        s = get_event_stats(eid)
+        send_message(cid, f"📊 <b>{s['event']['name']}</b>\n\n📋 {s['total_contacts']} в таблице · 🤖 {s['total_active']} в боте · ⏳ {s['not_activated_count']} не в боте\n\n✅ Идут: {s['going']}\n❌ Не смогут: {s['not_going']}\n🤷 Молчат: {s['no_response']}")
+
+    elif text == "/cleanup" and cid == ADMIN_CHAT_ID:
+        n = auto_archive()
+        send_message(cid, f"🗂 Архивировано мероприятий: {n}" if n else "Нечего архивировать — все мероприятия актуальны.")
+
+    elif text.startswith("/remove") and cid == ADMIN_CHAT_ID:
         parts = text.split()
-        if len(parts) < 2:
-            event = get_latest_event()
-            if not event:
-                send_message(chat_id, "Нет мероприятий. Создайте: /newevent")
-                return
-            event_id = event["id"]
-        else:
-            try:
-                event_id = int(parts[1])
-            except ValueError:
-                send_message(chat_id, "Используйте: <code>/stats N</code>")
-                return
-        stats = get_event_stats(event_id)
-        if not stats["event"]:
-            send_message(chat_id, f"❌ Мероприятие #{event_id} не найдено.")
-            return
-        send_message(chat_id,
-            f"📊 <b>Статистика: {stats['event']['name']}</b>\n\n"
-            f"📋 В Google-таблице: {stats['total_contacts']}\n"
-            f"🤖 В боте: {stats['total_active']}\n"
-            f"⏳ Не подключились: {stats['not_activated_count']}\n\n"
-            f"✅ Идут: {stats['going']}\n"
-            f"❌ Не смогут: {stats['not_going']}\n"
-            f"🤷 Молчат: {stats['no_response']}")
+        if len(parts) < 2: send_message(cid,"Используйте: <code>/remove @username</code>"); return
+        uname = parts[1].replace("@","").strip().lower()
+        conn = get_db(); c = conn.cursor()
+        c.execute("DELETE FROM contacts WHERE LOWER(username)=?", (uname,))
+        c.execute("DELETE FROM users WHERE LOWER(username)=?", (uname,))
+        c.execute("DELETE FROM sent_log WHERE chat_id IN (SELECT chat_id FROM users WHERE LOWER(username)=?)", (uname,))
+        deleted = conn.total_changes
+        conn.commit(); conn.close()
+        if deleted > 0: send_message(cid, f"✅ @{uname} удалён из бота. Анонсы больше приходить не будут.\n\n⚠️ Не забудьте удалить из Google-таблицы тоже.")
+        else: send_message(cid, f"❌ @{uname} не найден в базе.")
 
-    elif text == "/sync" and chat_id == ADMIN_CHAT_ID:
-        count, status = sync_google_sheet()
-        if status == "OK":
-            send_message(chat_id, f"✅ Таблица синхронизирована! Контактов: {count}")
-        else:
-            send_message(chat_id, f"❌ Ошибка: {status}")
+    elif text == "/sync" and cid == ADMIN_CHAT_ID:
+        cnt,st = sync_google_sheet()
+        send_message(cid, f"✅ Таблица обновлена! Контактов: {cnt}" if st=="OK" else f"❌ {st}")
 
-    elif text == "/link" and chat_id == ADMIN_CHAT_ID:
-        bot_user = get_bot_username()
-        link = f"https://t.me/{bot_user}" if bot_user else "(не удалось)"
-        send_message(chat_id, f"🔗 Ссылка на бота:\n\n{link}")
+    elif text == "/link" and cid == ADMIN_CHAT_ID:
+        bu = get_bot_username()
+        send_message(cid, f"🔗 https://t.me/{bu}" if bu else "Ошибка")
+
+    elif text == "/cancel" and cid == ADMIN_CHAT_ID:
+        if cid in admin_state: del admin_state[cid]
+        send_message(cid,"❌ Отменено.")
 
     elif text == "/help":
-        help_text = "📋 <b>Команды:</b>\n\n/start — О ближайшей встрече\n"
-        if chat_id == ADMIN_CHAT_ID:
-            help_text += (
-                "\n<b>Админ:</b>\n"
-                "/newevent — создать мероприятие\n"
-                "/events — список всех мероприятий\n"
-                "/broadcast N — разослать анонс (#N)\n"
-                "/stats N — статистика (#N)\n"
-                "/sync — обновить Google-таблицу\n"
-                "/link — ссылка на бота\n"
-                "/cancel — отменить создание\n"
-            )
-        send_message(chat_id, help_text)
-
+        h = "📋 <b>Команды:</b>\n\n/start — О ближайшей встрече\n"
+        if cid == ADMIN_CHAT_ID:
+            h += ("\n<b>Мероприятия:</b>\n/newevent — создать\n/events — активные\n/archive — прошедшие\n/edit N — редактировать\n/cleanup — архивировать прошедшие\n\n"
+                  "<b>Рассылки:</b>\n/broadcast N — всем\n/sendnew N — только новым\n/send N @user — одному\n/remind N — неответившим\n\n"
+                  "<b>Участники:</b>\n/sync — обновить таблицу\n/remove @user — удалить из бота\n/link — ссылка на бота\n")
+        send_message(cid, h)
     else:
-        if chat_id != ADMIN_CHAT_ID:
-            send_message(ADMIN_CHAT_ID,
-                f"💬 <b>{first_name} {last_name}</b> (@{username}):\n\n{text}")
-            send_message(chat_id, "Спасибо! Ваше сообщение передано организатору. 🤝")
+        if cid != ADMIN_CHAT_ID:
+            send_message(ADMIN_CHAT_ID, f"💬 <b>{fn} {ln}</b> (@{un}):\n\n{text}")
+            send_message(cid, "Спасибо! Сообщение передано организатору. 🤝")
 
 def poll_updates():
     offset = 0
     while True:
         try:
-            r = requests.get(f"{API}/getUpdates",
-                             params={"offset": offset, "timeout": 30}, timeout=35)
-            data = r.json()
-            if data.get("ok"):
-                for update in data["result"]:
-                    offset = update["update_id"] + 1
-                    try:
-                        handle_update(update)
-                    except Exception as e:
-                        print(f"Ошибка: {e}")
-        except Exception as e:
-            print(f"Polling: {e}")
-            time.sleep(5)
+            r = requests.get(f"{API}/getUpdates", params={"offset":offset,"timeout":30}, timeout=35).json()
+            if r.get("ok"):
+                for u in r["result"]:
+                    offset = u["update_id"]+1
+                    try: handle_update(u)
+                    except Exception as e: print(f"Err: {e}")
+        except Exception as e: print(f"Poll: {e}"); time.sleep(5)
 
 # ═══════════════════════════════════════════
-# ВЕБ — СПИСОК МЕРОПРИЯТИЙ
+# ВЕБ
 # ═══════════════════════════════════════════
 app = Flask(__name__)
 
-PAGE_EVENTS = """<!DOCTYPE html>
-<html lang="ru"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>Level Up — Мероприятия</title>
-<style>
-*{margin:0;padding:0;box-sizing:border-box;}
-body{background:#0A0D24;color:#fff;font-family:'Segoe UI',system-ui,sans-serif;padding:40px 20px;}
-.wrap{max-width:900px;margin:0 auto;}
-h1{font-size:28px;font-weight:800;margin-bottom:8px;}
-.sub{color:#A6ACD4;font-size:15px;margin-bottom:40px;}
-.event-card{background:#161C46;border:1px solid #33397A;border-radius:16px;padding:28px;margin-bottom:20px;
-  display:flex;justify-content:space-between;align-items:center;text-decoration:none;color:#fff;
-  transition:border-color .25s ease,transform .25s ease;cursor:pointer;}
-.event-card:hover{border-color:#5B9BFF;transform:translateY(-3px);}
-.event-card .info h2{font-size:20px;font-weight:800;margin-bottom:6px;}
-.event-card .info p{font-size:14px;color:#A6ACD4;}
-.event-card .nums{display:flex;gap:20px;text-align:center;}
-.event-card .num-box .n{font-size:28px;font-weight:800;}
-.event-card .num-box .l{font-size:11px;color:#A6ACD4;text-transform:uppercase;}
-.going .n{color:#4ADE80;}
-.notg .n{color:#F87171;}
-.empty{color:#A6ACD4;text-align:center;padding:60px 0;font-size:16px;}
-</style></head><body>
-<div class="wrap">
-<h1>📊 Level Up — Мероприятия</h1>
-<p class="sub">Мужской клуб предпринимателей</p>
-{% if events %}
-  {% for e in events %}
-  <a class="event-card" href="/event/{{ e.id }}">
-    <div class="info">
-      <h2>#{{ e.id }} · {{ e.name }}</h2>
-      <p>📅 {{ e.date }} в {{ e.time }} · 📍 {{ e.place }}</p>
-    </div>
-    <div class="nums">
-      <div class="num-box going"><div class="n">{{ e.going }}</div><div class="l">Идут</div></div>
-      <div class="num-box notg"><div class="n">{{ e.not_going }}</div><div class="l">Не смогут</div></div>
-    </div>
-  </a>
-  {% endfor %}
-{% else %}
-  <div class="empty">Мероприятий пока нет</div>
-{% endif %}
-</div>
-<script>setTimeout(()=>location.reload(),30000);</script>
-</body></html>"""
+PG_LIST = """<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Level Up — Мероприятия</title><style>
+*{margin:0;padding:0;box-sizing:border-box;}body{background:#0A0D24;color:#fff;font-family:'Segoe UI',system-ui,sans-serif;padding:40px 20px;}
+.wrap{max-width:900px;margin:0 auto;}h1{font-size:28px;font-weight:800;margin-bottom:8px;}.sub{color:#A6ACD4;font-size:15px;margin-bottom:30px;}
+.tabs{display:flex;gap:8px;margin-bottom:30px;}.tab{padding:10px 20px;border-radius:999px;font-size:14px;font-weight:600;text-decoration:none;border:1px solid #33397A;color:#A6ACD4;transition:all .2s;}
+.tab.active,.tab:hover{background:#33397A;color:#fff;}
+.ec{background:#161C46;border:1px solid #33397A;border-radius:16px;padding:28px;margin-bottom:20px;display:flex;justify-content:space-between;align-items:center;text-decoration:none;color:#fff;transition:all .25s;cursor:pointer;}
+.ec:hover{border-color:#5B9BFF;transform:translateY(-3px);}.ec.archived{opacity:0.6;}
+.ec .i h2{font-size:20px;font-weight:800;margin-bottom:6px;}.ec .i p{font-size:14px;color:#A6ACD4;}
+.ec .ns{display:flex;gap:20px;text-align:center;}.nb .n{font-size:28px;font-weight:800;}.nb .l{font-size:11px;color:#A6ACD4;text-transform:uppercase;}
+.go .n{color:#4ADE80;}.ng .n{color:#F87171;}.empty{color:#A6ACD4;text-align:center;padding:60px 0;}
+.badge{display:inline-block;font-size:11px;padding:4px 10px;border-radius:999px;margin-left:10px;font-weight:600;}
+.badge.active{background:rgba(74,222,128,0.15);color:#4ADE80;}.badge.arch{background:rgba(248,113,113,0.15);color:#F87171;}
+</style></head><body><div class="wrap">
+<h1>📊 Level Up — Мероприятия</h1><p class="sub">Мужской клуб предпринимателей</p>
+<div class="tabs"><a class="tab {{'active' if tab=='active' else ''}}" href="/">Активные</a><a class="tab {{'active' if tab=='archive' else ''}}" href="/archive">Архив</a></div>
+{% if events %}{% for e in events %}
+<a class="ec {{'archived' if not e.is_active else ''}}" href="/event/{{e.id}}">
+<div class="i"><h2>{{e.name}} {% if e.is_active %}<span class="badge active">Активно</span>{% else %}<span class="badge arch">Архив</span>{% endif %}</h2>
+<p>📅 {{e.date}} в {{e.time}} · 📍 {{e.place}}</p></div>
+<div class="ns"><div class="nb go"><div class="n">{{e.going}}</div><div class="l">Идут</div></div><div class="nb ng"><div class="n">{{e.not_going}}</div><div class="l">Не смогут</div></div></div></a>
+{% endfor %}{% else %}<div class="empty">{{'Активных мероприятий нет' if tab=='active' else 'Архив пуст'}}</div>{% endif %}
+</div><script>setTimeout(()=>location.reload(),30000);</script></body></html>"""
 
-PAGE_EVENT_DETAIL = """<!DOCTYPE html>
-<html lang="ru"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>{{ event.name }} — Статистика</title>
-<style>
-*{margin:0;padding:0;box-sizing:border-box;}
-body{background:#0A0D24;color:#fff;font-family:'Segoe UI',system-ui,sans-serif;padding:40px 20px;}
-.wrap{max-width:900px;margin:0 auto;}
-.back{color:#5B9BFF;text-decoration:none;font-size:14px;display:inline-block;margin-bottom:20px;}
-h1{font-size:26px;font-weight:800;margin-bottom:6px;}
-.sub{color:#A6ACD4;font-size:15px;margin-bottom:40px;}
+PG_DETAIL = """<!DOCTYPE html><html lang="ru"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>{{event.name}}</title><style>
+*{margin:0;padding:0;box-sizing:border-box;}body{background:#0A0D24;color:#fff;font-family:'Segoe UI',system-ui,sans-serif;padding:40px 20px;}
+.wrap{max-width:900px;margin:0 auto;}.back{color:#5B9BFF;text-decoration:none;font-size:14px;display:inline-block;margin-bottom:20px;}
+h1{font-size:26px;font-weight:800;margin-bottom:6px;}.sub{color:#A6ACD4;font-size:15px;margin-bottom:40px;}
 .cards{display:grid;grid-template-columns:repeat(5,1fr);gap:14px;margin-bottom:40px;}
 .card{background:#161C46;border:1px solid #33397A;border-radius:16px;padding:22px 16px;text-align:center;}
-.card .num{font-size:36px;font-weight:800;line-height:1;}
-.card .label{font-size:11px;color:#A6ACD4;text-transform:uppercase;letter-spacing:0.06em;margin-top:8px;}
-.going .num{color:#4ADE80;} .not .num{color:#F87171;} .wait .num{color:#FACC15;} .total .num{color:#5B9BFF;} .inactive .num{color:#FB923C;}
+.card .num{font-size:36px;font-weight:800;line-height:1;}.card .label{font-size:11px;color:#A6ACD4;text-transform:uppercase;margin-top:8px;}
+.go .num{color:#4ADE80;}.no .num{color:#F87171;}.wa .num{color:#FACC15;}.to .num{color:#5B9BFF;}.bo .num{color:#818CF8;}
 .bar-wrap{background:#161C46;border:1px solid #33397A;border-radius:12px;padding:20px;margin-bottom:40px;}
 .bar-bg{background:#0A0D24;border-radius:8px;height:32px;display:flex;overflow:hidden;}
-.bar-go{background:#4ADE80;height:100%;transition:width .6s ease;}
-.bar-no{background:#F87171;height:100%;transition:width .6s ease;}
-.bar-legend{display:flex;gap:20px;margin-top:12px;font-size:13px;color:#A6ACD4;}
-.bar-legend span::before{content:'';display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px;}
-.bar-legend .lg::before{background:#4ADE80;} .bar-legend .ln::before{background:#F87171;} .bar-legend .lw::before{background:#333;}
-h2{font-size:20px;font-weight:700;margin-bottom:16px;}
-.section{margin-bottom:40px;}
-table{width:100%;border-collapse:collapse;}
-th{text-align:left;font-size:12px;color:#A6ACD4;text-transform:uppercase;letter-spacing:0.06em;padding:10px 12px;border-bottom:1px solid #33397A;}
+.bar-go{background:#4ADE80;height:100%;}.bar-no{background:#F87171;height:100%;}
+.bl{display:flex;gap:20px;margin-top:12px;font-size:13px;color:#A6ACD4;}
+.bl span::before{content:'';display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px;}
+.lg::before{background:#4ADE80!important;}.ln::before{background:#F87171!important;}.lw::before{background:#333!important;}
+h2{font-size:20px;font-weight:700;margin-bottom:16px;}.sec{margin-bottom:40px;}
+table{width:100%;border-collapse:collapse;}th{text-align:left;font-size:12px;color:#A6ACD4;text-transform:uppercase;padding:10px 12px;border-bottom:1px solid #33397A;}
 td{padding:12px;border-bottom:1px solid #1D2456;font-size:14px;}
-.status-going{color:#4ADE80;} .status-not{color:#F87171;}
 .warn{background:#261A00;border:1px solid #FB923C;border-radius:12px;padding:20px;margin-bottom:40px;}
-.warn h3{color:#FB923C;font-size:16px;margin-bottom:10px;}
-.warn li{padding:4px 0;font-size:14px;color:#A6ACD4;list-style:none;}
-.warn li b{color:#fff;}
-.refresh{color:#5B9BFF;font-size:13px;text-decoration:none;float:right;margin-top:-36px;}
+.warn h3{color:#FB923C;font-size:16px;margin-bottom:10px;}.warn li{padding:4px 0;font-size:14px;color:#A6ACD4;list-style:none;}.warn b{color:#fff;}
+.ref{color:#5B9BFF;font-size:13px;text-decoration:none;float:right;margin-top:-36px;}
 @media(max-width:700px){.cards{grid-template-columns:repeat(2,1fr);}}
-</style></head><body>
-<div class="wrap">
-<a class="back" href="/">← Все мероприятия</a>
-<h1>📊 {{ event.name }}</h1>
-<p class="sub">📅 {{ event.date }} в {{ event.time }} · 📍 {{ event.place }}</p>
-
+</style></head><body><div class="wrap">
+<a class="back" href="/">← Назад</a>
+<h1>📊 {{event.name}}</h1><p class="sub">📅 {{event.date}} в {{event.time}} · 📍 {{event.place}}</p>
 <div class="cards">
-  <div class="card total"><div class="num">{{ total_contacts }}</div><div class="label">В таблице</div></div>
-  <div class="card" style=""><div class="num" style="color:#818CF8;">{{ total_active }}</div><div class="label">В боте</div></div>
-  <div class="card going"><div class="num">{{ going }}</div><div class="label">Идут</div></div>
-  <div class="card not"><div class="num">{{ not_going }}</div><div class="label">Не смогут</div></div>
-  <div class="card wait"><div class="num">{{ no_response }}</div><div class="label">Молчат</div></div>
-</div>
-
-{% if total_active > 0 %}
-<div class="bar-wrap">
-  {% set pct_go = (going / total_active * 100) if total_active > 0 else 0 %}
-  {% set pct_no = (not_going / total_active * 100) if total_active > 0 else 0 %}
-  <div class="bar-bg"><div class="bar-go" style="width:{{pct_go}}%"></div><div class="bar-no" style="width:{{pct_no}}%"></div></div>
-  <div class="bar-legend">
-    <span class="lg">Идут ({{ pct_go|round(0)|int }}%)</span>
-    <span class="ln">Не смогут ({{ pct_no|round(0)|int }}%)</span>
-    <span class="lw">Не ответили</span>
-  </div>
-</div>
-{% endif %}
-
-{% if not_activated_count > 0 %}
-<div class="warn">
-  <h3>⏳ Не подключились к боту ({{ not_activated_count }})</h3>
-  <ul>{% for c in not_activated %}<li><b>{{ c.name }} {{ c.get('contact_last','') }}</b> — @{{ c.username }}</li>{% endfor %}</ul>
-</div>
-{% endif %}
-
-<div class="section">
-  <h2>✅ Идут на встречу</h2>
-  <a class="refresh" href="/event/{{ event.id }}">🔄 Обновить</a>
-  <table>
-    <tr><th>Имя</th><th>Фамилия</th><th>Telegram</th><th>Когда ответил</th></tr>
-    {% for r in responses if r.status == 'going' %}
-    <tr><td>{{ r.first_name }}</td><td>{{ r.last_name }}</td><td>{{ '@' + r.username if r.username else '—' }}</td><td>{{ r.responded_at[:16] }}</td></tr>
-    {% endfor %}
-  </table>
-</div>
-
-<div class="section">
-  <h2>❌ Не смогут</h2>
-  <table>
-    <tr><th>Имя</th><th>Фамилия</th><th>Telegram</th><th>Когда ответил</th></tr>
-    {% for r in responses if r.status == 'not_going' %}
-    <tr><td>{{ r.first_name }}</td><td>{{ r.last_name }}</td><td>{{ '@' + r.username if r.username else '—' }}</td><td>{{ r.responded_at[:16] }}</td></tr>
-    {% endfor %}
-  </table>
-</div>
-</div>
-<script>setTimeout(()=>location.reload(),30000);</script>
-</body></html>"""
+<div class="card to"><div class="num">{{total_contacts}}</div><div class="label">В таблице</div></div>
+<div class="card bo"><div class="num">{{total_active}}</div><div class="label">В боте</div></div>
+<div class="card go"><div class="num">{{going}}</div><div class="label">Идут</div></div>
+<div class="card no"><div class="num">{{not_going}}</div><div class="label">Не смогут</div></div>
+<div class="card wa"><div class="num">{{no_response}}</div><div class="label">Молчат</div></div></div>
+{% if total_active>0 %}{% set pg=(going/total_active*100) %}{% set pn=(not_going/total_active*100) %}
+<div class="bar-wrap"><div class="bar-bg"><div class="bar-go" style="width:{{pg}}%"></div><div class="bar-no" style="width:{{pn}}%"></div></div>
+<div class="bl"><span class="lg">Идут ({{pg|round(0)|int}}%)</span><span class="ln">Не смогут ({{pn|round(0)|int}}%)</span><span class="lw">Не ответили</span></div></div>{% endif %}
+{% if not_activated_count>0 %}<div class="warn"><h3>⏳ Не в боте ({{not_activated_count}})</h3>
+<ul>{% for c in not_activated %}<li><b>{{c.name}} {{c.get('contact_last','')}}</b> — @{{c.username}}</li>{% endfor %}</ul></div>{% endif %}
+<div class="sec"><h2>✅ Идут</h2><a class="ref" href="/event/{{event.id}}">🔄</a>
+<table><tr><th>Имя</th><th>Фамилия</th><th>Telegram</th><th>Когда</th></tr>
+{% for r in responses if r.status=='going' %}<tr><td>{{r.first_name}}</td><td>{{r.last_name}}</td><td>{{'@'+r.username if r.username else '—'}}</td><td>{{r.responded_at[:16]}}</td></tr>{% endfor %}</table></div>
+<div class="sec"><h2>❌ Не смогут</h2><table><tr><th>Имя</th><th>Фамилия</th><th>Telegram</th><th>Когда</th></tr>
+{% for r in responses if r.status=='not_going' %}<tr><td>{{r.first_name}}</td><td>{{r.last_name}}</td><td>{{'@'+r.username if r.username else '—'}}</td><td>{{r.responded_at[:16]}}</td></tr>{% endfor %}</table></div>
+</div><script>setTimeout(()=>location.reload(),30000);</script></body></html>"""
 
 @app.route("/")
-def page_events():
-    events = get_all_events()
-    for e in events:
-        s = get_event_stats(e["id"])
-        e["going"] = s["going"]
-        e["not_going"] = s["not_going"]
-    return render_template_string(PAGE_EVENTS, events=events)
+def pg_active():
+    auto_archive(); evts = get_active_events()
+    for e in evts: s=get_event_stats(e["id"]); e["going"]=s["going"]; e["not_going"]=s["not_going"]
+    return render_template_string(PG_LIST, events=evts, tab="active")
 
-@app.route("/event/<int:event_id>")
-def page_event_detail(event_id):
-    stats = get_event_stats(event_id)
-    if not stats["event"]:
-        return "Мероприятие не найдено", 404
-    return render_template_string(PAGE_EVENT_DETAIL, **stats)
+@app.route("/archive")
+def pg_archive():
+    evts = get_archived_events()
+    for e in evts: s=get_event_stats(e["id"]); e["going"]=s["going"]; e["not_going"]=s["not_going"]
+    return render_template_string(PG_LIST, events=evts, tab="archive")
 
-@app.route("/api/stats/<int:event_id>")
-def api_stats(event_id):
-    return jsonify(get_event_stats(event_id))
+@app.route("/event/<int:eid>")
+def pg_detail(eid):
+    s = get_event_stats(eid)
+    if not s["event"]: return "Не найдено",404
+    return render_template_string(PG_DETAIL, **s)
 
-# ═══════════════════════════════════════════
 if __name__ == "__main__":
-    init_db()
-    bot_user = get_bot_username()
-    print("=" * 55)
-    print(f"  🤖  Бот Level Up v2 запущен")
-    if bot_user:
-        print(f"  🔗  https://t.me/{bot_user}")
-    print(f"  📊  Статистика: http://localhost:{WEB_PORT}")
-    print(f"=" * 55)
-
-    bot_thread = threading.Thread(target=poll_updates, daemon=True)
-    bot_thread.start()
+    init_db(); bu = get_bot_username()
+    print("="*55); print(f"  🤖  Level Up Bot v4")
+    if bu: print(f"  🔗  https://t.me/{bu}")
+    print(f"  📊  http://localhost:{WEB_PORT}"); print("="*55)
+    threading.Thread(target=poll_updates, daemon=True).start()
+    threading.Thread(target=archive_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=WEB_PORT)

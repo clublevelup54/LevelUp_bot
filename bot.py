@@ -30,7 +30,9 @@ ADMIN_CHAT_ID = 173317122
 SHEET_CSV_URL = "https://docs.google.com/spreadsheets/d/1FEV3V5zjDQ7D8yGfMMhocQjpPjgJ6pHF7rqT2hDIP5c/export?format=csv&gid=0"
 
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
-DB_FILE = "levelup_bot.db"
+DB_FILE = os.path.join(os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "/data"), "levelup_bot.db")
+# Создаём папку если нет
+os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
 WEB_PORT = int(os.environ.get("PORT", 5000))
 admin_state = {}
 

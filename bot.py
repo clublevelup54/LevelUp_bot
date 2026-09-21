@@ -616,10 +616,15 @@ def handle_news_callbacks(update):
     if "callback_query" not in update: return False
     cb=update["callback_query"]; data=cb.get("data",""); cid=cb["from"]["id"]
     if cid!=ADMIN_CHAT_ID: return False
-    if data=="news_send" and cid in admin_state and admin_state[cid].get("action")=="news":
-        st=admin_state[cid]; answer_callback(cb["id"],"Отправляю...")
-        sent,err=broadcast_news(st.get("news_text",""),st.get("news_mt"),st.get("news_mfid"))
-        del admin_state[cid]; send_message(cid,f"✅ Новость отправлена!\n📨 {sent} · ⚠️ {err}"); return True
+    if data=="news_send":
+        if cid in admin_state and admin_state[cid].get("action")=="news":
+            st=admin_state[cid]; answer_callback(cb["id"],"Отправляю...")
+            sent,err=broadcast_news(st.get("news_text",""),st.get("news_mt"),st.get("news_mfid"))
+            del admin_state[cid]; send_message(cid,f"✅ Новость отправлена!\n📨 {sent} · ⚠️ {err}"); return True
+        else:
+            answer_callback(cb["id"],"Черновик утерян")
+            send_message(cid,"⚠️ Черновик новости был утерян (бот перезапускался). Наберите /news ещё раз.")
+            return True
     elif data=="news_cancel":
         if cid in admin_state: del admin_state[cid]
         answer_callback(cb["id"],"Отменено"); send_message(cid,"❌ Рассылка отменена."); return True

@@ -1,5 +1,5 @@
 """
-LEVEL UP — Telegram-бот для мероприятий (v5)  
+LEVEL UP — Telegram-бот для мероприятий (v5)
 =============================================
 + Картинки/видео к анонсам и описаниям
 + Рассылка новостей без кнопок
@@ -223,19 +223,33 @@ def send_message(cid,text,reply_markup=None):
     except: return {"ok":False}
 
 def send_media(cid,media_type,file_id,caption="",reply_markup=None):
-    """Отправляет фото или видео"""
-    data={"chat_id":cid,"caption":caption,"parse_mode":"HTML"}
-    if reply_markup: data["reply_markup"]=json.dumps(reply_markup)
-    if media_type=="photo":
-        data["photo"]=file_id
-        try: return requests.post(f"{API}/sendPhoto",json=data,timeout=10).json()
-        except: return {"ok":False}
-    elif media_type=="video":
-        data["video"]=file_id
-        try: return requests.post(f"{API}/sendVideo",json=data,timeout=10).json()
-        except: return {"ok":False}
+    """Отправляет фото или видео. Если подпись длиннее 1024 символов
+    (лимит Telegram для caption), картинка отправляется без подписи,
+    а текст — отдельным сообщением следом."""
+    CAPTION_LIMIT = 1024
+    long_text = len(caption) > CAPTION_LIMIT
+
+    data = {"chat_id": cid, "parse_mode": "HTML"}
+    if not long_text:
+        data["caption"] = caption
+        if reply_markup: data["reply_markup"] = json.dumps(reply_markup)
+    endpoint = None
+    if media_type == "photo":
+        data["photo"] = file_id; endpoint = "sendPhoto"
+    elif media_type == "video":
+        data["video"] = file_id; endpoint = "sendVideo"
     else:
-        return send_message(cid,caption,reply_markup)
+        return send_message(cid, caption, reply_markup)
+
+    try:
+        result = requests.post(f"{API}/{endpoint}", json=data, timeout=15).json()
+    except:
+        return {"ok": False}
+
+    if long_text and result.get("ok"):
+        # Текст не поместился в подпись — шлём отдельным сообщением с кнопками
+        return send_message(cid, caption, reply_markup)
+    return result
 
 def send_event_message(cid,text,event=None,reply_markup=None,use_desc_media=False):
     """Отправляет сообщение с медиа мероприятия если есть"""
@@ -615,17 +629,34 @@ def handle_all(update):
     if handle_news_callbacks(update): return
     handle_update(update)
 
+LAST_POLL_TS = time.time()  # "сердцебиение" — обновляется на каждой итерации опроса
+
 def poll_updates():
+    global LAST_POLL_TS
     offset=0
+    session = requests.Session()
     while True:
+        LAST_POLL_TS = time.time()
         try:
-            r=requests.get(f"{API}/getUpdates",params={"offset":offset,"timeout":30},timeout=35).json()
+            # (connect_timeout, read_timeout) — раздельные таймауты защищают от зависаний
+            r=session.get(f"{API}/getUpdates",params={"offset":offset,"timeout":30},timeout=(10,40)).json()
             if r.get("ok"):
                 for u in r["result"]:
                     offset=u["update_id"]+1
                     try: handle_all(u)
                     except Exception as e: print(f"Err: {e}")
-        except Exception as e: print(f"Poll: {e}"); time.sleep(5)
+        except Exception as e:
+            print(f"Poll: {e}"); time.sleep(5)
+
+def watchdog_loop():
+    """Следит, что опрос Telegram не завис. Если пульса нет больше 3 минут — перезапускает поток."""
+    global LAST_POLL_TS
+    while True:
+        time.sleep(60)
+        if time.time() - LAST_POLL_TS > 180:
+            print("⚠️ Watchdog: опрос Telegram завис — перезапускаю поток")
+            LAST_POLL_TS = time.time()
+            threading.Thread(target=poll_updates, daemon=True).start()
 
 # ═══════════════════════════════════════════
 # ВЕБ
@@ -709,6 +740,12 @@ def pg_detail(eid):
     if not s["event"]: return "Не найдено",404
     return render_template_string(PG_DETAIL,**s)
 
+@app.route("/health")
+def health():
+    seconds_ago = time.time() - LAST_POLL_TS
+    status = "ok" if seconds_ago < 180 else "stuck"
+    return jsonify({"status": status, "last_poll_seconds_ago": round(seconds_ago)})
+
 if __name__=="__main__":
     init_db(); bu=get_bot_username()
     print("="*55); print(f"  🤖  Level Up Bot v5")
@@ -716,4 +753,5 @@ if __name__=="__main__":
     print(f"  📊  http://localhost:{WEB_PORT}"); print("="*55)
     threading.Thread(target=poll_updates,daemon=True).start()
     threading.Thread(target=archive_loop,daemon=True).start()
+    threading.Thread(target=watchdog_loop,daemon=True).start()
     app.run(host="0.0.0.0",port=WEB_PORT)

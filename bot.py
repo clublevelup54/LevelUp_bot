@@ -452,6 +452,7 @@ def handle_update(update):
                 if mt:
                     send_message(cid,"Текст и медиа получены. Отправить рассылку?",
                         {"inline_keyboard":[[{"text":"✅ Отправить","callback_data":"news_send"},{"text":"❌ Отмена","callback_data":"news_cancel"}]]})
+                    return
                 else:
                     send_message(cid,"🖼 Прикрепите <b>картинку или видео</b> к новости.\n\nЕсли без медиа — отправьте <b>-</b>"); return
             elif step=="news_media":
@@ -634,27 +635,33 @@ def handle_all(update):
     if handle_news_callbacks(update): return
     handle_update(update)
 
-LAST_POLL_TS = time.time()  # "сердцебиение" — обновляется на каждой итерации опроса
+LAST_POLL_TS = time.time()   # "сердцебиение" — обновляется на каждой итерации опроса
+GLOBAL_OFFSET = 0            # offset хранится вне функции — не сбрасывается при перезапуске потока
+POLL_GENERATION = 0          # если watchdog запускает новый поток, старый узнаёт об этом и сам завершается
 
 def poll_updates():
-    global LAST_POLL_TS
-    offset=0
+    global LAST_POLL_TS, GLOBAL_OFFSET, POLL_GENERATION
+    POLL_GENERATION += 1
+    my_gen = POLL_GENERATION
     session = requests.Session()
     while True:
+        if my_gen != POLL_GENERATION:
+            print(f"Poll: поток поколения {my_gen} остановлен (запущен более новый)")
+            return
         LAST_POLL_TS = time.time()
         try:
-            # (connect_timeout, read_timeout) — раздельные таймауты защищают от зависаний
-            r=session.get(f"{API}/getUpdates",params={"offset":offset,"timeout":30},timeout=(10,40)).json()
+            r=session.get(f"{API}/getUpdates",params={"offset":GLOBAL_OFFSET,"timeout":30},timeout=(10,40)).json()
             if r.get("ok"):
                 for u in r["result"]:
-                    offset=u["update_id"]+1
+                    GLOBAL_OFFSET=u["update_id"]+1
                     try: handle_all(u)
                     except Exception as e: print(f"Err: {e}")
         except Exception as e:
             print(f"Poll: {e}"); time.sleep(5)
 
 def watchdog_loop():
-    """Следит, что опрос Telegram не завис. Если пульса нет больше 3 минут — перезапускает поток."""
+    """Следит, что опрос Telegram не завис. Если пульса нет больше 3 минут — запускает новый поток
+    (старый сам остановится, увидев, что поколение сменилось — дублей не будет)."""
     global LAST_POLL_TS
     while True:
         time.sleep(60)

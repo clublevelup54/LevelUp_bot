@@ -9,7 +9,9 @@ import os, io, csv, json, sqlite3, threading, time, requests, re
 from datetime import datetime, date
 from flask import Flask, jsonify, render_template_string
 
-BOT_TOKEN = "8898623835:AAGqfdD2vNcH4kWfZfqEV4PgufezS9R5Xwk"
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN не задан! Добавьте переменную BOT_TOKEN в Railway → Variables.")
 ADMIN_CHAT_ID = 173317122
 SHEET_CSV_URL = "https://docs.google.com/spreadsheets/d/1FEV3V5zjDQ7D8yGfMMhocQjpPjgJ6pHF7rqT2hDIP5c/export?format=csv&gid=0"
 
